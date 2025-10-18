@@ -1,4 +1,4 @@
-// Note: load_result is a dev-only command for testing purposes
+// Note: load_result is a command for loading async query results
 // These tests verify the command syntax and basic functionality
 // Full end-to-end testing requires async query setup which is beyond csv-spec scope
 

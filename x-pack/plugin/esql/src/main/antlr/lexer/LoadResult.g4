@@ -7,9 +7,9 @@
 lexer grammar LoadResult;
 
 //
-// LOAD_RESULT command (tech preview - dev/snapshot only)
+// LOAD_RESULT command
 //
-DEV_LOAD_RESULT : {this.isDevVersion()}? 'load_result' -> pushMode(LOAD_RESULT_MODE);
+LOAD_RESULT : 'load_result' -> pushMode(LOAD_RESULT_MODE);
 
 mode LOAD_RESULT_MODE;
 LOAD_RESULT_PIPE : PIPE -> type(PIPE), popMode;

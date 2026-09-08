@@ -4,6 +4,8 @@
 **Depends on:** [scan-leaf proposal](esql-datafusion-scan-leaf-proposal.md) (Flight workers, file snapshot, `ArrowToEsql`)  
 **Does not change:** ES|QL language, analyzer, verifier, Lucene shards, or `UnionAll` merge on the coordinator
 
+End-to-end picture: [architecture](esql-datafusion-end-to-end-architecture.md).
+
 ## Goal
 
 After ES|QL logical optimization, **cut every federated-only subtree** and run it in DataFusion against S3. Lucene arms stay ES. The coordinator still unions rows and **combines partial aggregates**.

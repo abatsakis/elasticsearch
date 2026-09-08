@@ -4,6 +4,8 @@
 **Scope:** federated (non-Lucene) scans only  
 **Does not change:** ES|QL language, analyzer, verifier, Lucene execution, or `FROM index, dataset` union
 
+End-to-end picture (coordinator, Lucene arm, DF workers, merge): [architecture](esql-datafusion-end-to-end-architecture.md).
+
 ## Summary
 
 Keep ES|QL as the query language and compute engine. Keep Lucene as the indexed leaf. Add Apache DataFusion as a **scan runtime** for federated datasets: Elasticsearch discovers files, assigns them to a standing pool of N DataFusion workers, those workers read object storage, and Elasticsearch gathers Arrow batches into ES|QL Pages and unions them with Lucene Pages.

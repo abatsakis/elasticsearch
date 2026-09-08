@@ -177,6 +177,7 @@ Metadata columns (`_index` = dataset name, `_file.path`, `_id`, …) are produce
 
 - Allowlisted `STATS BY` partials on DF workers, merge in ES|QL.
 - Only after Phase 2 parity. Still no Lucene in DataFusion.
+- The concrete cut, IR, and mixed-`UnionAll` work is specified in the [branch planner implementation plan](esql-datafusion-branch-planner-plan.md).
 
 ## Semantic contract
 

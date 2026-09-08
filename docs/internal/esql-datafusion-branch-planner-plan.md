@@ -105,6 +105,67 @@ Safer v1: **ES logical plan is final; DF only physicalizes** (parquet prune, has
 
 ---
 
+## DataFusion side: a worker server, not a query cluster
+
+DataFusion is a **Rust library**. It does not accept jobs, speak Flight, or sit in a replica set by itself. Something must wrap it.
+
+**Yes: build a small, stateless Flight worker.**  
+**No: do not build Ballista, Flight SQL, a catalog, or a second coordinator.** Elasticsearch is already the scheduler.
+
+```
+ES coordinator                    DF worker replica (× N)
+  BranchCutter + file buckets       Arrow Flight server
+  DoAction(submit) / DoGet    →     decode ticket
+                                    DataFusion ExecutionPlan from IR
+                                    object_store → S3
+                                    stream RecordBatches
+```
+
+N copies of **the same binary**. ES’s worker registry is an explicit list of those processes. Do not put a round-robin load balancer in front and hope: ES picked *this* worker for *these* files; the stream must stick to that process.
+
+### What the worker implements
+
+| Piece | Role |
+|---|---|
+| Arrow Flight (`DoGet`, plus `DoAction` if the job is larger than a ticket) | Only RPC ES needs. Matches the existing `FlightConnector` client shape (`DoGet` + Arrow schema). |
+| Ticket / job decoder | IR + file list + schema + `PARTIAL`/`FINAL` + budgets. Versioned. Not SQL. |
+| Plan builder | Map IR operators onto DataFusion `ExecutionPlan` (`ListingTable`/`FileScanConfig` for parquet, `FilterExec`, `ProjectionExec`, `AggregateExec`). **Physicalize only.** |
+| `object_store` crate | Read the paths ES already authorized. No `list()`. |
+| RecordBatch stream | Output schema exactly as the IR specified (including `$$partial$$*` names). |
+| Liveness | Cheap Flight action or HTTP `/health` for the registry. |
+| Memory / cancel | DataFusion memory pool capped by the ticket budget; abort when ES cancels the Flight stream. |
+
+Suggested stack: `datafusion` + `arrow-flight` + `object_store` (S3 first). One binary, config = bind address + object-store identity (IRSA / instance role / env). **No long-lived cloud keys from ES in the ticket.**
+
+Large jobs: `DoAction("submit_job", payload)` → opaque job id → `DoGet(job id)`. That avoids `FlightSplit`’s 16 KiB ticket cap.
+
+### What not to run on the worker
+
+- **Parser / SQL.** No Flight SQL server (`datafusion-flight-sql`). ES already planned.
+- **Catalog / Iceberg REST / Hive.** ES resolved the dataset and files.
+- **Cluster scheduler (Ballista).** Two schedulers will disagree on `LIMIT` and partial `STATS`. Mode A (DF-internal shuffle) is a later, dataset-only opt-in — still not v1.
+- **Listing or glob.** If a path is missing, fail that job; do not discover extra objects.
+- **Authz.** If the ticket has a path, the worker may read it (IAM still applies). Which paths exist is ES’s problem.
+- **JNI inside ES.** The worker is a separate process so scan CPU/crashes stay off the ES JVM.
+
+### Process lifecycle
+
+Workers are idle Flight servers. A job is request-scoped: open store clients, run the plan, stream, drop the session. No sticky query state across jobs. Scale-out = more replicas in the registry, not a DF cluster join protocol.
+
+For local tests, the same binary can run one replica next to Gradle QA (like other datasource ITs). Production is N replicas with ES listing them on the data source or a cluster setting.
+
+### Protocol sketch (v1)
+
+1. ES assigns file bucket `W` to worker `i`.
+2. ES `submit_job` `{ ir, paths, schema, agg_mode: PARTIAL, budget }`.
+3. Worker builds `ExecutionPlan`, starts execution.
+4. ES `DoGet` until EOS; `ArrowToEsql` → Pages.
+5. Failure: Flight error → that bucket fails or marks partial; other workers continue.
+
+The worker does not need `GetFlightInfo` multi-endpoint splitting. ES already split by files. `GetSchema` is optional (ES already has the schema); the stream schema must still match the IR.
+
+---
+
 ## Allowlist (v1)
 
 **Operators:** `ExternalRelation`/`Scan`, `Filter`, `Project`, `Eval` (scalar subset), `Aggregate` algebraic (`COUNT`, `SUM`, `MIN`, `MAX`; `AVG` after surrogate), `Limit`.

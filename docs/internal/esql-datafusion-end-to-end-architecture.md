@@ -371,7 +371,7 @@ If the cut cannot include `STATS` (non-allowlisted op below it), DF streams **ro
 | New: cut | `BranchCutter`, `DataFusionExec`, expression allowlist |
 | New: assign | worker registry, LPT buckets (not `AdaptiveStrategy` onto ES nodes) |
 | New: client | Flight submit/DoGet, `ArrowToEsql` |
-| New: worker | out-of-tree (or `esql-datasource-datafusion`) Flight + DataFusion + `object_store` |
+| New: worker | `esql-datafusion/` Cargo workspace — Flight worker + HTTP rendezvous (not in Gradle) |
 | Feature gate | `Federation` (`esql.federation.enabled`) |
 
 ---
@@ -380,3 +380,4 @@ If the cut cannot include `STATS` (non-allowlisted op below it), DF streams **ro
 
 - [Scan-leaf proposal](esql-datafusion-scan-leaf-proposal.md) — why DF as a scan runtime, worker registry, what not to plug (FormatReader JNI, SQL).
 - [Branch planner plan](esql-datafusion-branch-planner-plan.md) — cutter algorithm, allowlist, phases, IR, testing, worker protocol details.
+- [`esql-datafusion/`](../../esql-datafusion/README.md) — Rust rendezvous + DataFusion Flight worker (v1 parquet).

@@ -1,0 +1,5 @@
+area: ES|QL
+issues: []
+pr: 3
+summary: "ES|QL: recompute single-valued derived STATS BY keys above the aggregate"
+type: enhancement

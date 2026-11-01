@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = ["crates/ir", "crates/rendezvous", "crates/worker"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+publish = false
+
+[workspace.dependencies]
+esql-df-ir = { path = "crates/ir" }
+anyhow = "1"
+# DataFusion 45 depends on Arrow 54; Flight must use the same major.
+arrow-flight = "54.2"
+async-stream = "0.3"
+axum = { version = "0.7", features = ["json"] }
+bytes = "1"
+chrono = { version = "=0.4.39", features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+datafusion = "45"
+futures = "0.3"
+object_store = { version = "0.11", features = ["aws"] }
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "net"] }
+tonic = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }

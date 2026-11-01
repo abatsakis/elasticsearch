@@ -31,8 +31,9 @@ import java.util.Map;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.referenceAttribute;
 
 /**
- * Golden (characterization) snapshot of the optimized logical plan for a derived external grouping, which
- * {@link PruneRedundantAggregateGroupings} leaves untouched (only scalar constants are pruned). See GoldenTestsReadme.md.
+ * Golden (characterization) snapshot of the optimized logical plan for a derived external grouping. This fixture
+ * carries no column statistics, so {@link PruneRedundantAggregateGroupings} cannot prove the source column
+ * single-valued and leaves the derived key in the aggregate. See GoldenTestsReadme.md.
  */
 public class PruneRedundantAggregateGroupingsGoldenTests extends GoldenTestCase {
     private static final EnumSet<Stage> STAGES = EnumSet.of(Stage.LOGICAL_OPTIMIZATION);

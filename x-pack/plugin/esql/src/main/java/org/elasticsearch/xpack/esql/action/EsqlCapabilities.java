@@ -3241,9 +3241,10 @@ public class EsqlCapabilities {
          * pre-aggregate attribute it no longer surfaces, fixing the {@code optimized incorrectly due to missing references}
          * verification failure that old coordinators in a mixed cluster still hit.
          * <p>
-         * Derived external groupings are no longer pruned at all (see {@link #FIX_DERIVED_EXTERNAL_GROUPING_MULTIVALUE}),
-         * so the rebuilt expression this describes no longer exists; the capability still gates the spec that used to
-         * fail with the verification error above, which older coordinators can still produce.
+         * A derived external grouping is pruned only when complete source statistics prove every input column
+         * single-valued (see {@link #FIX_DERIVED_EXTERNAL_GROUPING_MULTIVALUE}). The rebuilt expression this capability
+         * describes, which read a renamed attribute, no longer fails verification either way; the capability still
+         * gates the spec that used to fail with the error above, which older coordinators can still produce.
          */
         FIX_PRUNE_RENAMED_DERIVED_EXTERNAL_GROUPING,
 
@@ -4553,8 +4554,9 @@ public class EsqlCapabilities {
         /**
          * A {@code STATS BY} key derived from other external integral keys with {@code +}, {@code -} or unary minus
          * (e.g. {@code EVAL s = emp_no + salary_change.int | STATS ... BY emp_no, salary_change.int, s}) is kept as a
-         * grouping and evaluated on the row, so it is {@code null} where an input column holds a list. Older nodes
-         * pruned it from the aggregate and recomputed it per group, returning one number per list element. Used to
+         * grouping and evaluated on the row, so it is {@code null} where an input column holds a list, unless complete
+         * source statistics prove every input column single-valued. Older nodes pruned it from the aggregate and
+         * recomputed it per group whenever the inputs were integral, returning one number per list element. Used to
          * gate the external csv-spec tests asserting the {@code null}, which such nodes still fail.
          */
         FIX_DERIVED_EXTERNAL_GROUPING_MULTIVALUE,

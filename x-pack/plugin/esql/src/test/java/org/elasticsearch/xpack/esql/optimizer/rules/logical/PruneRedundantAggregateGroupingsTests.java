@@ -7,10 +7,23 @@
 
 package org.elasticsearch.xpack.esql.optimizer.rules.logical;
 
+import org.elasticsearch.cluster.metadata.DataSourceReference;
+import org.elasticsearch.cluster.metadata.Dataset;
+import org.elasticsearch.cluster.metadata.ProjectId;
+import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.indices.TestIndexNameExpressionResolver;
 import org.elasticsearch.xpack.esql.action.EsqlCapabilities;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expressions;
+import org.elasticsearch.xpack.esql.datasources.ExternalSourceMetadata;
+import org.elasticsearch.xpack.esql.datasources.ExternalSourceResolution;
+import org.elasticsearch.xpack.esql.datasources.FormatNameResolver;
+import org.elasticsearch.xpack.esql.datasources.SourceStatisticsSerializer;
+import org.elasticsearch.xpack.esql.datasources.metadata.DataSource;
+import org.elasticsearch.xpack.esql.datasources.metadata.DataSourceMetadata;
+import org.elasticsearch.xpack.esql.datasources.spi.FileList;
+import org.elasticsearch.xpack.esql.datasources.spi.SourceStatistics;
 import org.elasticsearch.xpack.esql.optimizer.AbstractLogicalPlanOptimizerTests;
 import org.elasticsearch.xpack.esql.parser.ExpressionBuilder;
 import org.elasticsearch.xpack.esql.plan.logical.Aggregate;
@@ -25,10 +38,15 @@ import org.elasticsearch.xpack.esql.plan.logical.join.StubRelation;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.elasticsearch.xpack.esql.EsqlTestUtils.TEST_PARSER;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.as;
 import static org.elasticsearch.xpack.esql.EsqlTestUtils.referenceAttribute;
+import static org.elasticsearch.xpack.esql.EsqlTestUtils.rewriteDatasetsUnsecured;
 import static org.elasticsearch.xpack.esql.core.type.DataType.INTEGER;
 import static org.elasticsearch.xpack.esql.core.type.DataType.KEYWORD;
 import static org.hamcrest.Matchers.contains;
@@ -143,8 +161,9 @@ public class PruneRedundantAggregateGroupingsTests extends AbstractLogicalPlanOp
     /**
      * A key derived from another external key with {@code -} looks functionally dependent on it, but only while the
      * source column is single-valued: on a row holding a list the derived key evaluates to {@code null} and the
-     * aggregate unrolls the list into one group per element. The rule therefore keeps derived keys in the aggregate,
-     * where they are evaluated on the row, and leaves the pre-aggregate {@code EVAL} in place.
+     * aggregate unrolls the list into one group per element. With no source statistics the rule cannot prove that, so
+     * it keeps the derived keys in the aggregate, where they are evaluated on the row, and leaves the pre-aggregate
+     * {@code EVAL} in place.
      */
     public void testDoesNotPruneDerivedExternalGroupings() {
         var plan = externalPlan("""
@@ -224,6 +243,170 @@ public class PruneRedundantAggregateGroupingsTests extends AbstractLogicalPlanOp
         var eval = as(aggregate.child(), Eval.class);
         assertThat(Expressions.names(eval.fields()), contains("c"));
         as(eval.child(), ExternalRelation.class);
+    }
+
+    /**
+     * ClickBench q36. Parquet publishes a null count only for a non-repeated column, so {@code ClientIP} is proven
+     * single-valued and {@code ip_m1}, {@code ip_m2}, {@code ip_m3} are recomputed after grouping on {@code ClientIP}
+     * alone.
+     */
+    public void testPrunesDerivedGroupingsWhenParquetNullCountProvesSingleValue() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL ip_m1 = ClientIP - 1, ip_m2 = ClientIP - 2, ip_m3 = ClientIP - 3
+            | STATS c = COUNT(*) BY ClientIP, ip_m1, ip_m2, ip_m3
+            | SORT c DESC
+            | LIMIT 10
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(1_000L, Map.of("ClientIP", column(0L, null))));
+
+        Aggregate aggregate = singleAggregate(plan);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP"));
+        assertThat(Expressions.names(aggregate.aggregates()), contains("c", "ClientIP"));
+        as(aggregate.child(), ExternalRelation.class);
+
+        Eval postAggregateEval = singleEvalAbove(plan, aggregate);
+        assertThat(Expressions.names(postAggregateEval.fields()), contains("ip_m1", "ip_m2", "ip_m3"));
+        for (var field : postAggregateEval.fields()) {
+            assertThat(Expressions.names(field.child().references()), contains("ClientIP"));
+        }
+    }
+
+    /** {@code ip_m2 = ip_m1 - 1} unfolds through {@code ip_m1} onto the single-valued {@code ClientIP}. */
+    public void testPrunesRecursiveDerivedGroupingWhenSingleValued() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL ip_m1 = ClientIP - 1, ip_m2 = ip_m1 - 1
+            | STATS c = COUNT(*) BY ClientIP, ip_m2
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(100L, Map.of("ClientIP", column(4L, null))));
+
+        Aggregate aggregate = singleAggregate(plan);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP"));
+        assertThat(Expressions.names(aggregate.aggregates()), contains("c", "ClientIP"));
+        as(aggregate.child(), ExternalRelation.class);
+
+        Eval postAggregateEval = singleEvalAbove(plan, aggregate);
+        assertThat(Expressions.names(postAggregateEval.fields()), contains("ip_m2"));
+        assertThat(Expressions.names(postAggregateEval.fields().get(0).child().references()), contains("ClientIP"));
+    }
+
+    /** A rename must be rebound to the attribute the aggregate actually exposes, {@code cip}, not the pre-aggregate name. */
+    public void testPrunesRenamedDerivedGroupingWhenSingleValued() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | RENAME ClientIP AS cip
+            | EVAL c = cip - 1
+            | STATS count = COUNT(*) BY cip, c
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(100L, Map.of("ClientIP", column(0L, null))));
+
+        Aggregate aggregate = singleAggregate(plan);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP"));
+        assertThat(Expressions.names(aggregate.aggregates()), contains("count", "cip"));
+        as(aggregate.child(), ExternalRelation.class);
+
+        Eval postAggregateEval = singleEvalAbove(plan, aggregate);
+        assertThat(Expressions.names(postAggregateEval.fields()), contains("c"));
+        assertThat(Expressions.names(postAggregateEval.fields().get(0).child().references()), contains("cip"));
+    }
+
+    /** Unary minus is the same dependency as subtraction. */
+    public void testPrunesUnaryMinusDerivedGroupingWhenSingleValued() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL neg = -ClientIP
+            | STATS c = COUNT(*) BY ClientIP, neg
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(10L, Map.of("ClientIP", column(0L, null))));
+
+        Aggregate aggregate = singleAggregate(plan);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP"));
+        as(aggregate.child(), ExternalRelation.class);
+        assertThat(Expressions.names(singleEvalAbove(plan, aggregate).fields()), contains("neg"));
+    }
+
+    /** A value count equal to the non-null rows proves single-valued for a format that is not Parquet. */
+    public void testPrunesDerivedGroupingWhenValueCountMatchesNonNullRows() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL s = ClientIP + OtherIP
+            | STATS c = COUNT(*) BY ClientIP, OtherIP, s
+            """, "ndjson", Map.of(), statistics(50L, Map.of("ClientIP", column(5L, 45L), "OtherIP", column(0L, 50L))));
+
+        Aggregate aggregate = singleAggregate(plan);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP", "OtherIP"));
+        as(aggregate.child(), ExternalRelation.class);
+        assertThat(Expressions.names(singleEvalAbove(plan, aggregate).fields()), contains("s"));
+    }
+
+    /** A published value count above the non-null rows means some cell is a list, so the derived key stays. */
+    public void testDoesNotPruneWhenValueCountShowsMultivalue() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL ip_m1 = ClientIP - 1
+            | STATS c = COUNT(*) BY ClientIP, ip_m1
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(100L, Map.of("ClientIP", column(0L, 140L))));
+
+        var aggregate = as(as(plan, Limit.class).child(), Aggregate.class);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP", "ip_m1"));
+        as(aggregate.child(), Eval.class);
+    }
+
+    /** Anchor-only statistics are marked partial and must not license a dataset-wide rewrite. */
+    public void testDoesNotPruneDerivedGroupingOnPartialStats() {
+        var plan = planWithColumnStats(
+            """
+                FROM ext_ds
+                | EVAL ip_m1 = ClientIP - 1
+                | STATS c = COUNT(*) BY ClientIP, ip_m1
+                """,
+            FormatNameResolver.FORMAT_PARQUET,
+            Map.of(SourceStatisticsSerializer.STATS_PARTIAL, true),
+            statistics(100L, Map.of("ClientIP", column(0L, null)))
+        );
+
+        var aggregate = as(as(plan, Limit.class).child(), Aggregate.class);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP", "ip_m1"));
+        as(aggregate.child(), Eval.class);
+    }
+
+    /**
+     * ORC publishes a null count for list columns too, computed as {@code rows - numberOfValues}, so a null count alone
+     * does not prove a single value. Without a value count the derived key stays.
+     */
+    public void testDoesNotPruneWhenOnlyOrcNullCountIsKnown() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL ip_m1 = ClientIP - 1
+            | STATS c = COUNT(*) BY ClientIP, ip_m1
+            """, "orc", Map.of(), statistics(100L, Map.of("ClientIP", column(0L, null))));
+
+        var aggregate = as(as(plan, Limit.class).child(), Aggregate.class);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP", "ip_m1"));
+        as(aggregate.child(), Eval.class);
+    }
+
+    /** One input of a sum is not proven single-valued, so the sum can still separate groups and stays a grouping. */
+    public void testDoesNotPruneWhenOneInputIsNotProvenSingleValued() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL s = ClientIP + OtherIP
+            | STATS c = COUNT(*) BY ClientIP, OtherIP, s
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(100L, Map.of("ClientIP", column(0L, null))));
+
+        var aggregate = as(as(plan, Limit.class).child(), Aggregate.class);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP", "OtherIP", "s"));
+        as(aggregate.child(), Eval.class);
+    }
+
+    /** Multiplication is not in the set of dependencies this rule recomputes, even on a proven single-valued column. */
+    public void testDoesNotPruneMultiplicationDerivedGrouping() {
+        var plan = planWithColumnStats("""
+            FROM ext_ds
+            | EVAL doubled = ClientIP * 2
+            | STATS c = COUNT(*) BY ClientIP, doubled
+            """, FormatNameResolver.FORMAT_PARQUET, Map.of(), statistics(100L, Map.of("ClientIP", column(0L, null))));
+
+        var aggregate = as(as(plan, Limit.class).child(), Aggregate.class);
+        assertThat(Expressions.names(aggregate.groupings()), contains("ClientIP", "doubled"));
+        as(aggregate.child(), Eval.class);
     }
 
     public void testDoesNotPruneInlineStatsGroupings() {
@@ -448,5 +631,126 @@ public class PruneRedundantAggregateGroupingsTests extends AbstractLogicalPlanOp
 
     private static Aggregate rewrittenAggregate(Eval eval) {
         return as(as(eval.child(), Limit.class).child(), Aggregate.class);
+    }
+
+    /** The one {@link Eval} sitting above {@code aggregate}. The pre-aggregate eval, when the rule keeps it, is below. */
+    private static Eval singleEvalAbove(LogicalPlan plan, Aggregate aggregate) {
+        List<Eval> evals = new ArrayList<>();
+        plan.forEachDown(Eval.class, eval -> {
+            if (eval.anyMatch(p -> p == aggregate)) {
+                evals.add(eval);
+            }
+        });
+        assertThat(evals, hasSize(1));
+        return evals.get(0);
+    }
+
+    /**
+     * Like {@link #externalPlan} but the resolved source carries {@code statistics}. {@code valueCount} of {@code null}
+     * in {@link #column} means the format did not publish one.
+     */
+    private LogicalPlan planWithColumnStats(
+        String query,
+        String sourceType,
+        Map<String, Object> sourceMetadata,
+        SourceStatistics statistics
+    ) {
+        assumeTrue("requires FROM <dataset> capability", EsqlCapabilities.Cap.DATASET_IN_FROM_COMMAND.isEnabled());
+        List<Attribute> schema = externalSchema();
+        String dataSourceName = DATASET_NAME + "_ds";
+        ProjectMetadata datasetMetadata = ProjectMetadata.builder(ProjectId.DEFAULT)
+            .putCustom(
+                DataSourceMetadata.TYPE,
+                new DataSourceMetadata(Map.of(dataSourceName, new DataSource(dataSourceName, "test", null, Map.of())))
+            )
+            .datasets(Map.of(DATASET_NAME, new Dataset(DATASET_NAME, new DataSourceReference(dataSourceName), S3_RESOURCE, null, Map.of())))
+            .build();
+        LogicalPlan rewritten = rewriteDatasetsUnsecured(
+            TEST_PARSER.parseQuery(query),
+            datasetMetadata,
+            TestIndexNameExpressionResolver.newInstance(),
+            false
+        );
+        var metadata = new ExternalSourceMetadata() {
+            @Override
+            public String location() {
+                return S3_RESOURCE;
+            }
+
+            @Override
+            public List<Attribute> schema() {
+                return schema;
+            }
+
+            @Override
+            public String sourceType() {
+                return sourceType;
+            }
+
+            @Override
+            public Optional<SourceStatistics> statistics() {
+                return Optional.of(statistics);
+            }
+
+            @Override
+            public Map<String, Object> sourceMetadata() {
+                return sourceMetadata;
+            }
+        };
+        var resolved = new ExternalSourceResolution.ResolvedSource(metadata, FileList.UNRESOLVED, Map.of());
+        return optimize(
+            analyzer().externalSourceResolution(new ExternalSourceResolution(Map.of(S3_RESOURCE, resolved)))
+                .buildAnalyzer()
+                .analyze(rewritten)
+        );
+    }
+
+    private static SourceStatistics statistics(long rows, Map<String, SourceStatistics.ColumnStatistics> columns) {
+        return new SourceStatistics() {
+            @Override
+            public OptionalLong rowCount() {
+                return OptionalLong.of(rows);
+            }
+
+            @Override
+            public OptionalLong sizeInBytes() {
+                return OptionalLong.empty();
+            }
+
+            @Override
+            public Optional<Map<String, ColumnStatistics>> columnStatistics() {
+                return Optional.of(columns);
+            }
+        };
+    }
+
+    /** {@code valueCount == null} leaves the count unpublished, the way a Parquet footer omits it. */
+    private static SourceStatistics.ColumnStatistics column(long nulls, Long valueCount) {
+        return new SourceStatistics.ColumnStatistics() {
+            @Override
+            public OptionalLong nullCount() {
+                return OptionalLong.of(nulls);
+            }
+
+            @Override
+            public OptionalLong valueCount() {
+                return valueCount == null ? OptionalLong.empty() : OptionalLong.of(valueCount);
+            }
+
+            @Override
+            public OptionalLong distinctCount() {
+                return OptionalLong.empty();
+            }
+
+            @Override
+            public Optional<Object> minValue() {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<Object> maxValue() {
+                return Optional.empty();
+            }
+        };
     }
 }
